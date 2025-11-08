@@ -1,0 +1,250 @@
+// @ts-nocheck
+// --- 設定情報 ---
+// 以下のシート名は、STEP 1で作成したシート名と一致させてください
+const DB_SHEET_NAME = 'DB_募集一覧';
+const SETTINGS_SHEET_NAME = '設定';
+const ID_PREFIX = 'CS-'; // 募集IDの接頭辞
+
+// --- ユーティリティ（設定シートから値を取得する関数） ---
+
+/**
+ * 設定シートを取得する
+ */
+function getSettingsSheet() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SETTINGS_SHEET_NAME);
+}
+
+/**
+ * DBシートを取得する
+ */
+function getDbSheet() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(DB_SHEET_NAME);
+}
+
+/**
+ * Webhook URLを取得する
+ * @param {string} type - '事務課用' または '学生用'
+ */
+function getWebhookUrl(type) {
+  const sheet = getSettingsSheet();
+  if (type === '事務課用') {
+    return sheet.getRange('B1').getValue();
+  } else if (type === '学生用') {
+    return sheet.getRange('B2').getValue();
+  }
+}
+
+/**
+ * Slackにメッセージを送信する
+ * @param {string} webhookUrl - 送信先のWebhook URL
+ * @param {string} message - 送信するメッセージ
+ */
+function postToSlack(webhookUrl, message) {
+  // Webhook URLが設定シートに入力されているかチェック
+  if (!webhookUrl || webhookUrl === '') {
+    Logger.log('Webhook URLが設定シートに入力されていません。');
+    return; // URLがなければ処理を中断
+  }
+  
+  const payload = { 'text': message };
+  const options = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'payload': JSON.stringify(payload)
+  };
+  UrlFetchApp.fetch(webhookUrl, options);
+}
+
+// --- メイン機能 (1) 募集フォームの処理 ---
+
+/**
+ * [フォームA] 交代募集フォーム が送信された時に実行される
+ * @param {Object} e - フォーム送信イベント
+ */
+function onFormSubmit_Post(e) {
+  try {
+    // 1. フォームの回答を取得
+    // ※STEP 2で作成したフォームの質問名と一致している必要があります
+    const originalStaff = e.namedValues['あなたの名前（元の担当者）'][0];
+    const workDateTime = e.namedValues['交代したい勤務日時'][0];
+    const reason = e.namedValues['交代理由'][0];
+    const shiftDate = e.namedValues['勤務日（日付のみ）'][0];
+    // 2. 新しい募集IDを「設定」シートから発行する
+    const settingsSheet = getSettingsSheet();
+    const idCell = settingsSheet.getRange('B3');
+    const lastId = idCell.getValue();
+    const newIdNumber = lastId + 1;
+    idCell.setValue(newIdNumber); // IDを更新
+    const newId = ID_PREFIX + newIdNumber;
+    
+    // 3. DBシートに新しい募集を追記
+    const dbSheet = getDbSheet();
+    const timestamp = new Date();
+    dbSheet.appendRow([
+      newId,           // A列: 募集ID
+      '募集中',        // B列: ステータス
+      workDateTime,    // C列: 勤務日時
+      originalStaff,   // D列: 元の担当者
+      '',              // E列: 新しい担当者 (空)
+      timestamp,        // F列: 募集登録日時
+      shiftDate        // G列: 勤務日(ソート用) ★新しい日付データを保存
+    ]);
+    
+    // 4. 学生用Slackに「新規募集」を通知
+    const message = `【新規募集】\n` +
+                    `ID: ${newId}\n` +
+                    `日時： ${workDateTime}\n` +
+                    `担当： ${originalStaff} さん\n` +
+                    `理由： ${reason} \n` +
+                    `交代できる方は、交代申請フォームからID (${newId}) を使って応募してください。`;
+    postToSlack(getWebhookUrl('学生用'), message);
+    
+  } catch (error) {
+    Logger.log('募集フォーム処理エラー: ' + error);
+    // (オプション) エラー発生を事務課Slackに通知する
+    // postToSlack(getWebhookUrl('事務課用'), 'エラー発生(募集フォーム): ' + error);
+  }
+}
+
+
+// --- メイン機能 (2) 申請フォームの処理 ---
+
+/**
+ * [フォームB] 交代申請フォーム が送信された時に実行される
+ * @param {Object} e - フォーム送信イベント
+ */
+function onFormSubmit_Apply(e) {
+  try {
+    // 1. フォームの回答を取得
+    // ※STEP 2で作成したフォームの質問名と一致している必要があります
+    const applyId = e.namedValues['応募する募集ID'][0];
+    const newStaff = e.namedValues['あなたの名前（新しい担当者）'][0];
+
+    const dbSheet = getDbSheet();
+    const data = dbSheet.getDataRange().getValues();
+    
+    let rowFound = -1;
+    let workDateTime, originalStaff, currentStatus;
+    
+    // 2. DBをスキャンして、該当IDの行を探す
+    // (ヘッダー行をスキップするために i=1 から始める)
+    for (let i = 1; i < data.length; i++) {
+      // 募集IDがテキストとして一致するか確認 (例: CS-101)
+      if (String(data[i][0]).trim() === String(applyId).trim()) { 
+        rowFound = i; // 0ベースの行インデックス (iは1ベースなので+1不要)
+        currentStatus = data[i][1]; // B列(ステータス)
+        workDateTime = data[i][2];  // C列(勤務日時)
+        originalStaff = data[i][3]; // D列(元の担当者)
+        break;
+      }
+    }
+
+    // 3. マッチング処理
+    if (rowFound === -1) {
+      // 該当IDが見つからない（入力ミスなど）
+      Logger.log(`ID ${applyId} がDBに見つかりませんでした。`);
+      // (オプション) 申請者本人にSlackでエラー通知（別途仕組みが必要）
+      return;
+    }
+    
+    if (currentStatus !== '募集中') {
+      // すでに成立済み（早い者勝ち）
+      Logger.log(`ID ${applyId} は既に ${currentStatus} です。`);
+      // (オプション) 申請者本人にSlackで「締め切られました」と通知（別途仕組みが必要）
+      return;
+    }
+    
+    // 4. 成立処理：DBを更新
+    // (スプレッドシートの行番号は1ベースなので、rowFound + 1)
+    const dbRow = rowFound + 1;
+    dbSheet.getRange(dbRow, 2).setValue('成立');      // B列: ステータスを「成立」に
+    dbSheet.getRange(dbRow, 5).setValue(newStaff);  // E列: 新しい担当者を書き込む
+
+    // 5. 事務課用Slackに「交代成立」を通知
+    const message = `【交代成立】\n` +
+                    `ID: ${applyId}\n` +
+                    `日時： ${workDateTime}\n` +
+                    `担当： ${originalStaff} さん → ${newStaff} さん\n` +
+                    `------------------------------\n` +
+                    `事務課への連絡は忘れずに。交代よろしくお願いします。`;
+    postToSlack(getWebhookUrl('事務課用'), message);
+    
+  } catch (error) {
+    Logger.log('申請フォーム処理エラー: ' + error);
+    // (オプション) エラー発生を事務課Slackに通知する
+    // postToSlack(getWebhookUrl('事務課用'), 'エラー発生(申請フォーム): ' + error);
+  }
+}
+
+
+// --- メイン機能 (3) 募集一覧の定期投稿 ---
+// (差し替え後のコード)
+
+/**
+ * 毎日朝などに定期実行する関数
+ */
+function postOpenShiftsToStudentChannel() {
+  try {
+    const dbSheet = getDbSheet();
+    const dataRange = dbSheet.getDataRange(); // シート全体の範囲を取得
+    const data = dataRange.getValues();
+    
+    let openShifts = []; // 募集中のシフトを入れる配列
+    
+    // ★「今日」の0時0分0秒のDateオブジェクトを準備 (タイムゾーン考慮)
+    let today = new Date();
+    today.setHours(0, 0, 0, 0); 
+    
+    // DBをスキャン (ヘッダー行 i=0 をスキップ)
+    for (let i = 1; i < data.length; i++) {
+      
+      let status = data[i][1]; // B列(ステータス)
+      const shiftDateString = data[i][6]; // G列(勤務日(ソート用))
+      
+      // ★--- ここから期限切れ処理 ---★
+      // G列に日付データがあり、かつステータスが「募集中」の場合のみチェック
+      if (shiftDateString && status === '募集中') {
+        
+        let shiftDate = new Date(shiftDateString);
+        shiftDate.setHours(0, 0, 0, 0); // シフト日も0時0分に揃える
+        
+        // もしシフトの日付が「今日」より前（＝昨日以前）なら
+        if (shiftDate < today) {
+          
+          // スプレッドシート本体のステータスを「期限切れ」に更新
+          const dbRow = i + 1; // (iは0ベース、行番号は1ベース)
+          dbSheet.getRange(dbRow, 2).setValue('期限切れ');
+          
+          status = '期限切れ'; // メモリ上のステータスも更新（一覧に載せないため）
+        }
+      }
+      // ★--- 期限切れ処理ここまで ---★
+      
+      
+      // （既存の処理）もしステータスが「募集中」なら
+      if (status === '募集中') {
+        const id = data[i][0];       // A列
+        const dateTime = data[i][2]; // C列
+        const staff = data[i][3];    // D列
+        openShifts.push(`・[${id}] ${dateTime} (担当: ${staff} さん)`);
+      }
+    }
+    
+    let message = '';
+    if (openShifts.length === 0) {
+      message = '現在、募集中の交代シフトはありません。';
+    } else {
+      message = '【現在募集中の交代シフト一覧】\n\n' +
+                openShifts.join('\n') +
+                '\n\n交代できる方は、交代申請フォームから「募集ID」を使って応募してください。';
+    }
+    
+    // 6. 学生用Slackに一覧を投稿
+    postToSlack(getWebhookUrl('学生用'), message);
+    
+  } catch (error) {
+    Logger.log('定期投稿エラー: ' + error);
+    // (オプション) エラー発生を事務課Slackに通知する
+    // postToSlack(getWebhookUrl('事務課用'), 'エラー発生(定期投稿): ' + error);
+  }
+}
